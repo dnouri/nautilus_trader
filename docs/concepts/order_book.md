@@ -121,15 +121,33 @@ or `Delete` is skipped. If the ID exists on both sides, an `Add` returns
 
 Out-of-order deltas and depth snapshots are applied rather than rejected, so a venue that replays
 or reorders events still reaches the state those events describe. Only the book metadata is
-protected: `sequence` and `ts_last` are high-water marks and never regress. A stale update logs one
-warning for each field that regressed, `sequence` and `ts_event` independently, and how often it
-logs depends on how the update arrives:
+protected: `ts_last` never regresses, and `sequence` never regresses within a sequence domain (see
+below). A stale update logs one warning for each field that regressed, `sequence` and `ts_event`
+independently, and how often it logs depends on how the update arrives:
 
 - **Incremental deltas**: Once per stale delta.
 - **Snapshot deltas**: Once per snapshot, whether it arrives as an `F_SNAPSHOT` batch or as a
   single `F_SNAPSHOT` delta, since every delta in a rebuild shares the snapshot's sequence and
   timestamp.
 - **Depth snapshots**: Once, since an `OrderBookDepth10` replaces the book in a single update.
+
+Some venue feeds restart their sequence counter per session or week. A full book clear **without**
+the `F_SNAPSHOT` flag starts a new sequence domain: the sequence high-water resets to the clear's
+sequence, and the prior domain is forgotten for all subsequent records. Snapshot-flagged clears and
+snapshot rebuilds keep the prior high-water instead. Per-delta out-of-order detection within the
+new domain is fully intact, so the only detection lost is the comparison of post-clear records
+against the pre-clear domain; a stale non-snapshot clear itself no longer warns.
+
+The public `clear()` method (Rust and Python) always takes the reset branch, unlike
+`clear_bids()`/`clear_asks()`, which preserve the high-water. The `sequence` metadata therefore
+observably changes across a non-snapshot clear, including via Python and exported snapshots; book
+contents, liquidity, matching behavior, `ts_last`, and update counts are unchanged.
+
+The no-warning guarantee after a legitimate restart covers the per-delta incremental warnings
+above. The once-per-batch snapshot report is computed from batch metadata before any delta is
+applied, so it can still fire once for a batch that carries a nonzero snapshot sequence across a
+domain boundary. Databento's decoder zeroes snapshot sequences, so its batches cannot trigger
+this.
 
 A snapshot report describes the incoming snapshot, so it does not depend on whether each of its
 deltas reaches the book. An `L1_MBP` book driven by quotes or trades is the exception to all of

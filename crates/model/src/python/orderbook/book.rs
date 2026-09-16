@@ -124,6 +124,9 @@ impl OrderBook {
     }
 
     /// Clears all orders from both sides of the book.
+    ///
+    /// Unlike `clear_bids` and `clear_asks`, this resets the sequence high-water: a full clear
+    /// starts a new sequence domain, so `sequence` becomes the high-water of the new domain.
     #[pyo3(name = "clear")]
     #[pyo3(signature = (sequence, ts_event))]
     fn py_clear(&mut self, sequence: u64, ts_event: u64) {

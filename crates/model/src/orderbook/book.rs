@@ -162,6 +162,9 @@ impl OrderBook {
     }
 
     /// Clears all orders from both sides of the book.
+    ///
+    /// Unlike `clear_bids` and `clear_asks`, this resets the sequence high-water: a full clear
+    /// starts a new sequence domain, so `sequence` becomes the high-water of the new domain.
     pub fn clear(&mut self, sequence: u64, ts_event: UnixNanos) {
         self.clear_with_flags(sequence, ts_event, 0);
     }
@@ -181,6 +184,12 @@ impl OrderBook {
     fn clear_with_flags(&mut self, sequence: u64, ts_event: UnixNanos, flags: u8) {
         self.bids.clear();
         self.asks.clear();
+
+        // A non-snapshot clear starts a new sequence domain, unlike a snapshot rebuild
+        if !RecordFlag::F_SNAPSHOT.matches(flags) {
+            self.sequence = 0;
+        }
+
         self.increment(sequence, ts_event, flags);
     }
 

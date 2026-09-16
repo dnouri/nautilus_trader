@@ -29,8 +29,10 @@ use rust_decimal_macros::dec;
 
 use crate::{
     data::{
-        OrderBookDelta, OrderBookDeltas, QuoteTick, TradeTick, depth::OrderBookDepth10,
-        order::BookOrder, stubs::*,
+        OrderBookDelta, OrderBookDeltas, QuoteTick, TradeTick,
+        depth::OrderBookDepth10,
+        order::{BookOrder, NULL_ORDER},
+        stubs::*,
     },
     enums::{
         AggressorSide, BookAction, BookType, OrderSide, OrderStatus, OrderType, RecordFlag,
@@ -1775,6 +1777,328 @@ fn test_book_update_stale_quote_tick_does_not_mutate_l1() {
     assert_eq!(book.best_ask_price().unwrap(), Price::from("10.000"));
 }
 
+#[fixture]
+fn sequence_domain_book() -> OrderBook {
+    let mut book = OrderBook::new(InstrumentId::from("ES.GLBX"), BookType::L3_MBO);
+    book.add(
+        BookOrder::new(OrderSide::Buy, Price::from("99.00"), Quantity::from(100), 1),
+        0,
+        49,
+        UnixNanos::from(1000),
+    );
+    book.add(
+        BookOrder::new(
+            OrderSide::Sell,
+            Price::from("101.00"),
+            Quantity::from(75),
+            2,
+        ),
+        0,
+        50,
+        UnixNanos::from(1000),
+    );
+    book
+}
+
+#[rstest]
+#[case::zero(0)]
+#[case::nonzero(1)]
+fn test_book_sequence_domain_weekly_restart(
+    mut sequence_domain_book: OrderBook,
+    #[case] clear_sequence: u64,
+) {
+    let book = &mut sequence_domain_book;
+    let instrument_id = book.instrument_id;
+    let bid = BookOrder::new(OrderSide::Buy, Price::from("98.00"), Quantity::from(50), 3);
+    let ask = BookOrder::new(
+        OrderSide::Sell,
+        Price::from("102.00"),
+        Quantity::from(60),
+        4,
+    );
+
+    // Databento's Sunday CLEAR carries F_BAD_TS_RECV (8), but not F_SNAPSHOT
+    book.apply_delta(&OrderBookDelta::new(
+        instrument_id,
+        BookAction::Clear,
+        NULL_ORDER,
+        8,
+        clear_sequence,
+        UnixNanos::from(2000),
+        UnixNanos::from(2000),
+    ))
+    .unwrap();
+
+    // The decoder zeroes sequences on the following snapshot ADDs
+    for order in [bid, ask] {
+        book.apply_delta(&OrderBookDelta::new(
+            instrument_id,
+            BookAction::Add,
+            order,
+            RecordFlag::F_SNAPSHOT as u8,
+            0,
+            UnixNanos::from(2000),
+            UnixNanos::from(2000),
+        ))
+        .unwrap();
+    }
+
+    assert_eq!(book.sequence, clear_sequence);
+    assert_eq!(book.update_count, 5);
+
+    book.apply_delta(&OrderBookDelta::new(
+        instrument_id,
+        BookAction::Update,
+        BookOrder {
+            size: Quantity::from(25),
+            ..bid
+        },
+        RecordFlag::F_LAST as u8,
+        2,
+        UnixNanos::from(2001),
+        UnixNanos::from(2001),
+    ))
+    .unwrap();
+    book.apply_delta(&OrderBookDelta::new(
+        instrument_id,
+        BookAction::Delete,
+        ask,
+        RecordFlag::F_LAST as u8,
+        3,
+        UnixNanos::from(2002),
+        UnixNanos::from(2002),
+    ))
+    .unwrap();
+
+    assert_eq!(book.sequence, 3);
+    assert_eq!(book.ts_last, UnixNanos::from(2002));
+    assert_eq!(book.update_count, 7);
+    assert_eq!(book.bids(None).count(), 1);
+    assert_eq!(book.best_bid_price(), Some(bid.price));
+    assert_eq!(book.best_bid_size(), Some(Quantity::from(25)));
+    assert_eq!(book.asks(None).count(), 0);
+}
+
+#[rstest]
+#[case::zero_unflagged(0, 0)]
+#[case::zero_last(0, RecordFlag::F_LAST as u8)]
+#[case::zero_bad_ts_recv(0, 8)]
+#[case::nonzero_unflagged(7, 0)]
+#[case::nonzero_last(7, RecordFlag::F_LAST as u8)]
+#[case::nonzero_bad_ts_recv(7, 8)]
+fn test_book_sequence_domain_clear_metadata(
+    mut sequence_domain_book: OrderBook,
+    #[case] sequence: u64,
+    #[case] flags: u8,
+    #[values(500, 1000, 2000)] ts_event: u64,
+) {
+    let book = &mut sequence_domain_book;
+    book.apply_delta(&OrderBookDelta::new(
+        book.instrument_id,
+        BookAction::Clear,
+        NULL_ORDER,
+        flags,
+        sequence,
+        UnixNanos::from(ts_event),
+        UnixNanos::from(2000),
+    ))
+    .unwrap();
+
+    assert_eq!(book.bids(None).count(), 0);
+    assert_eq!(book.asks(None).count(), 0);
+    assert_eq!(book.sequence, sequence);
+    assert_eq!(book.ts_last, UnixNanos::from(ts_event.max(1000)));
+    assert_eq!(book.update_count, 3);
+}
+
+#[rstest]
+#[case::without_clear(false, 50, 3)]
+#[case::after_clear(true, 10, 5)]
+fn test_book_sequence_domain_stale_incremental(
+    mut sequence_domain_book: OrderBook,
+    #[case] restart: bool,
+    #[case] high_water: u64,
+    #[case] update_count: u64,
+) {
+    let book = &mut sequence_domain_book;
+    let bid = BookOrder::new(OrderSide::Buy, Price::from("99.00"), Quantity::from(100), 1);
+
+    if restart {
+        book.clear(0, UnixNanos::from(2000));
+        book.add(bid, 0, high_water, UnixNanos::from(3000));
+    }
+
+    assert_eq!(book.sequence, high_water);
+
+    book.apply_delta(&OrderBookDelta::new(
+        book.instrument_id,
+        BookAction::Update,
+        BookOrder {
+            size: Quantity::from(25),
+            ..bid
+        },
+        0,
+        high_water - 1,
+        UnixNanos::from(4000),
+        UnixNanos::from(4000),
+    ))
+    .unwrap();
+
+    assert_eq!(book.sequence, high_water);
+    assert_eq!(book.ts_last, UnixNanos::from(4000));
+    assert_eq!(book.update_count, update_count);
+    assert_eq!(book.best_bid_size(), Some(Quantity::from(25)));
+}
+
+#[rstest]
+#[case::zero_sequence_factory_clear(0)]
+#[case::earlier_snapshot_sequence(20)]
+fn test_book_sequence_domain_snapshot_preserves_high_water(
+    mut sequence_domain_book: OrderBook,
+    #[case] snapshot_sequence: u64,
+) {
+    let book = &mut sequence_domain_book;
+    let instrument_id = book.instrument_id;
+    let bid = BookOrder::new(OrderSide::Buy, Price::from("98.00"), Quantity::from(50), 3);
+    let snapshot = OrderBookDeltas::new(
+        instrument_id,
+        vec![
+            OrderBookDelta::clear(
+                instrument_id,
+                snapshot_sequence,
+                UnixNanos::from(2000),
+                UnixNanos::from(2000),
+            ),
+            OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                bid,
+                RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8,
+                snapshot_sequence,
+                UnixNanos::from(2000),
+                UnixNanos::from(2000),
+            ),
+        ],
+    );
+    book.apply_deltas(&snapshot).unwrap();
+
+    assert_eq!(book.sequence, 50);
+
+    book.update(
+        BookOrder {
+            size: Quantity::from(25),
+            ..bid
+        },
+        0,
+        30,
+        UnixNanos::from(3000),
+    );
+
+    assert_eq!(book.sequence, 50);
+    assert_eq!(book.ts_last, UnixNanos::from(3000));
+    assert_eq!(book.update_count, 5);
+    assert_eq!(book.bids(None).count(), 1);
+    assert_eq!(book.best_bid_price(), Some(bid.price));
+    assert_eq!(book.best_bid_size(), Some(Quantity::from(25)));
+    assert_eq!(book.asks(None).count(), 0);
+}
+
+#[rstest]
+#[case::non_snapshot_clear(8)]
+#[case::weekday_snapshot_clear(RecordFlag::F_SNAPSHOT as u8 | 8)]
+fn test_book_sequence_domain_weekday_continuation(
+    mut sequence_domain_book: OrderBook,
+    #[case] clear_flags: u8,
+) {
+    let book = &mut sequence_domain_book;
+    let instrument_id = book.instrument_id;
+    let bid = BookOrder::new(OrderSide::Buy, Price::from("98.00"), Quantity::from(50), 3);
+    let rebuild = OrderBookDeltas::new(
+        instrument_id,
+        vec![
+            OrderBookDelta::new(
+                instrument_id,
+                BookAction::Clear,
+                NULL_ORDER,
+                clear_flags,
+                0,
+                UnixNanos::from(2000),
+                UnixNanos::from(2000),
+            ),
+            OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                bid,
+                RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8,
+                0,
+                UnixNanos::from(2000),
+                UnixNanos::from(2000),
+            ),
+        ],
+    );
+    book.apply_deltas(&rebuild).unwrap();
+    book.update(
+        BookOrder {
+            size: Quantity::from(25),
+            ..bid
+        },
+        0,
+        51,
+        UnixNanos::from(3000),
+    );
+
+    assert_eq!(book.sequence, 51);
+    assert_eq!(book.ts_last, UnixNanos::from(3000));
+    assert_eq!(book.update_count, 5);
+    assert_eq!(book.bids(None).count(), 1);
+    assert_eq!(book.best_bid_price(), Some(bid.price));
+    assert_eq!(book.best_bid_size(), Some(Quantity::from(25)));
+    assert_eq!(book.asks(None).count(), 0);
+}
+
+#[rstest]
+fn test_book_sequence_domain_batch_uses_clear_flags(mut sequence_domain_book: OrderBook) {
+    let book = &mut sequence_domain_book;
+    let instrument_id = book.instrument_id;
+    let bid = BookOrder::new(OrderSide::Buy, Price::from("98.00"), Quantity::from(50), 3);
+    let batch = OrderBookDeltas::new(
+        instrument_id,
+        vec![
+            OrderBookDelta::new(
+                instrument_id,
+                BookAction::Clear,
+                NULL_ORDER,
+                8,
+                0,
+                UnixNanos::from(2000),
+                UnixNanos::from(2000),
+            ),
+            OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                bid,
+                RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8,
+                0,
+                UnixNanos::from(2000),
+                UnixNanos::from(2000),
+            ),
+        ],
+    );
+    book.apply_deltas(&batch).unwrap();
+
+    assert!(RecordFlag::F_SNAPSHOT.matches(batch.flags));
+    assert_eq!(book.sequence, 0);
+
+    book.update(bid, 0, 1, UnixNanos::from(3000));
+
+    assert_eq!(book.sequence, 1);
+    assert_eq!(book.ts_last, UnixNanos::from(3000));
+    assert_eq!(book.update_count, 5);
+    assert_eq!(book.bids(None).count(), 1);
+    assert_eq!(book.best_bid_size(), Some(bid.size));
+    assert_eq!(book.asks(None).count(), 0);
+}
+
 struct BookWarnCapture {
     messages: Mutex<Vec<String>>,
 }
@@ -1980,6 +2304,81 @@ fn test_apply_deltas_snapshot_rebuild_with_earlier_sequence_warns_once() {
     assert_eq!(book.bids(None).count(), 1);
     assert_eq!(book.best_bid_price().unwrap(), Price::from("98.00"));
     assert_eq!(book.sequence, 50);
+    assert_eq!(book.ts_last, UnixNanos::from(2000));
+    assert_eq!(book.update_count, 3);
+}
+
+#[rstest]
+fn test_apply_deltas_domain_reset_mid_batch_reports_snapshot_once() {
+    let _guard = start_book_warn_capture();
+
+    let instrument_id = InstrumentId::from("MIDBATCH.TEST");
+    let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+    book.apply_delta(&OrderBookDelta::new(
+        instrument_id,
+        BookAction::Add,
+        BookOrder::new(
+            OrderSide::Buy,
+            Price::from("99.00"),
+            Quantity::from("100"),
+            0,
+        ),
+        0,
+        50,
+        UnixNanos::from(1000),
+        UnixNanos::from(1000),
+    ))
+    .unwrap();
+    BOOK_WARN_CAPTURE.take_for(instrument_id);
+
+    // Batch metadata comes from the last delta, so a nonzero snapshot sequence on the trailing
+    // ADD is reported against the pre-clear high-water even though the leading non-snapshot
+    // CLEAR resets the domain mid-batch. Databento's decoder zeroes snapshot sequences, so it
+    // cannot produce this batch
+    let batch = OrderBookDeltas::new(
+        instrument_id,
+        vec![
+            OrderBookDelta::new(
+                instrument_id,
+                BookAction::Clear,
+                NULL_ORDER,
+                0,
+                0,
+                UnixNanos::from(2000),
+                UnixNanos::from(2000),
+            ),
+            OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                BookOrder::new(
+                    OrderSide::Buy,
+                    Price::from("98.00"),
+                    Quantity::from("50"),
+                    0,
+                ),
+                RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8,
+                20,
+                UnixNanos::from(2000),
+                UnixNanos::from(2000),
+            ),
+        ],
+    );
+
+    book.apply_deltas(&batch).unwrap();
+
+    // Only the pre-application batch report fires: the domain reset mid-batch suppresses the
+    // per-delta incremental sequence checks
+    assert_eq!(
+        BOOK_WARN_CAPTURE.take_for(instrument_id),
+        vec![
+            "Out-of-order snapshot: sequence 20 < 50 (deltas=2, \
+             instrument_id=MIDBATCH.TEST)"
+                .to_string()
+        ],
+    );
+    assert_eq!(book.sequence, 20);
+    assert_eq!(book.bids(None).count(), 1);
+    assert_eq!(book.best_bid_price().unwrap(), Price::from("98.00"));
     assert_eq!(book.ts_last, UnixNanos::from(2000));
     assert_eq!(book.update_count, 3);
 }
