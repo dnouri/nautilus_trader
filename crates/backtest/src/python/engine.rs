@@ -45,7 +45,10 @@ use nautilus_model::{
         OrderBookDepth, QuoteTick, TradeTick,
     },
     enums::{AccountType, BookType, OmsType, OtoTriggerMode},
-    identifiers::{AccountId, ActorId, ClientId, ExecAlgorithmId, InstrumentId, TraderId, Venue},
+    identifiers::{
+        AccountId, ActorId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, StrategyId,
+        TraderId, Venue,
+    },
     python::instruments::pyobject_to_instrument_any,
     types::{Currency, Money},
 };
@@ -71,8 +74,77 @@ use super::{modules::pyobject_to_simulation_module_handle, node::create_importab
 use crate::{
     config::{BacktestEngineConfig, SimulatedVenueConfig},
     engine::BacktestEngine,
+    execution_client::SubmissionRecord,
     result::BacktestResult,
 };
+
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
+impl SubmissionRecord {
+    #[getter]
+    #[pyo3(name = "event_id")]
+    const fn py_event_id(&self) -> UUID4 {
+        self.event_id
+    }
+
+    #[getter]
+    #[pyo3(name = "client_order_id")]
+    const fn py_client_order_id(&self) -> ClientOrderId {
+        self.client_order_id
+    }
+
+    #[getter]
+    #[pyo3(name = "init_id")]
+    const fn py_init_id(&self) -> UUID4 {
+        self.init_id
+    }
+
+    #[getter]
+    #[pyo3(name = "command_id")]
+    const fn py_command_id(&self) -> UUID4 {
+        self.command_id
+    }
+
+    #[getter]
+    #[pyo3(name = "strategy_id")]
+    const fn py_strategy_id(&self) -> StrategyId {
+        self.strategy_id
+    }
+
+    #[getter]
+    #[pyo3(name = "instrument_id")]
+    const fn py_instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    #[getter]
+    #[pyo3(name = "account_id")]
+    const fn py_account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    #[getter]
+    #[pyo3(name = "trader_id")]
+    const fn py_trader_id(&self) -> TraderId {
+        self.trader_id
+    }
+
+    #[getter]
+    #[pyo3(name = "ts_event")]
+    fn py_ts_event(&self) -> u64 {
+        self.ts_event.as_u64()
+    }
+
+    #[getter]
+    #[pyo3(name = "ts_init")]
+    fn py_ts_init(&self) -> u64 {
+        self.ts_init.as_u64()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
 
 /// PyO3 wrapper around [`BacktestEngine`].
 ///
@@ -685,6 +757,12 @@ impl PyBacktestEngine {
     #[pyo3(name = "list_venues")]
     fn py_list_venues(&self) -> Vec<Venue> {
         self.0.list_venues()
+    }
+
+    /// Returns an immutable snapshot of generated submission records.
+    #[pyo3(name = "submission_records", signature = ())]
+    fn py_submission_records(&self) -> Vec<SubmissionRecord> {
+        self.0.submission_records()
     }
 
     /// Returns the cache shared with the kernel and registered components.
