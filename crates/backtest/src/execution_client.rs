@@ -495,6 +495,7 @@ mod tests {
         let records = client.submission_records();
         assert_eq!(records.len(), 1);
         let queued = client.queued_events.borrow();
+        assert_eq!(queued.len(), 1);
         let OrderEventAny::Submitted(event) = &queued[0] else {
             panic!("expected queued OrderSubmitted event");
         };
@@ -622,20 +623,6 @@ mod tests {
         assert_eq!(records[0].init_id, records[1].init_id);
         assert_eq!(records[0].ts_event, records[1].ts_event);
         assert_ne!(records[0].event_id, records[1].event_id);
-    }
-
-    #[rstest]
-    fn test_submission_is_recorded_before_queued_events_are_drained() {
-        let (client, _exchange) = setup_client_with_latency();
-        let order = test_order(ClientOrderId::from("O-NOT-DRAINED"), UUID4::new());
-        cache_order(&client, &order, false);
-
-        client
-            .submit_order(submit_command(&order, UUID4::new(), UnixNanos::default()))
-            .unwrap();
-
-        assert_eq!(client.queued_events.borrow().len(), 1);
-        assert_eq!(client.submission_records().len(), 1);
     }
 
     #[rstest]

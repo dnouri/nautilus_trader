@@ -2429,7 +2429,7 @@ mod tests {
             AccountType, BookType, LiquiditySide, MarketStatus, MarketStatusAction, OmsType,
             OrderSide, OrderStatus, OrderType, PositionSide, TriggerType,
         },
-        events::OrderEventAny,
+        events::{OrderEventAny, OrderSubmitted},
         identifiers::{AccountId, ActorId, ClientId, ClientOrderId, PositionId, StrategyId, Venue},
         instruments::{
             CryptoPerpetual, Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt,
@@ -2532,6 +2532,7 @@ mod tests {
         instrument_id: InstrumentId,
         submit_on_start: bool,
         submit_on_stop: bool,
+        submitted_callback_count: Rc<Cell<usize>>,
     }
 
     impl LifecycleSubmissionStrategy {
@@ -2540,6 +2541,7 @@ mod tests {
             instrument_id: InstrumentId,
             submit_on_start: bool,
             submit_on_stop: bool,
+            submitted_callback_count: Rc<Cell<usize>>,
         ) -> Self {
             Self {
                 core: StrategyCore::new(StrategyConfig {
@@ -2549,6 +2551,7 @@ mod tests {
                 instrument_id,
                 submit_on_start,
                 submit_on_stop,
+                submitted_callback_count,
             }
         }
 
@@ -2585,7 +2588,12 @@ mod tests {
         }
     }
 
-    nautilus_strategy!(LifecycleSubmissionStrategy);
+    nautilus_strategy!(LifecycleSubmissionStrategy, {
+        fn on_order_submitted(&mut self, _event: OrderSubmitted) {
+            self.submitted_callback_count
+                .set(self.submitted_callback_count.get() + 1);
+        }
+    });
 
     #[derive(Debug)]
     struct QuoteSubmissionStrategy {
@@ -2950,6 +2958,112 @@ mod tests {
     }
 
     #[rstest]
+    fn test_submission_records_aggregate_venues_in_registration_order() {
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        let first_venue = Venue::from("SIM");
+        let second_venue = Venue::from("BINANCE");
+        engine
+            .add_venue(
+                SimulatedVenueConfig::builder()
+                    .venue(first_venue)
+                    .oms_type(OmsType::Netting)
+                    .account_type(AccountType::Margin)
+                    .book_type(BookType::L1_MBP)
+                    .starting_balances(vec![Money::from("1_000_000 USDT")])
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        engine
+            .add_venue(
+                SimulatedVenueConfig::builder()
+                    .venue(second_venue)
+                    .oms_type(OmsType::Netting)
+                    .account_type(AccountType::Margin)
+                    .book_type(BookType::L1_MBP)
+                    .starting_balances(vec![Money::from("1_000_000 USDT")])
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .exec_clients
+                .iter()
+                .map(ExecutionClient::venue)
+                .collect::<Vec<_>>(),
+            vec![first_venue, second_venue]
+        );
+
+        let first_order = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(engine.trader_id())
+            .instrument_id(InstrumentId::from("AUD/USD.SIM"))
+            .client_order_id(ClientOrderId::from("O-FIRST-REGISTERED"))
+            .quantity(Quantity::from("1.000"))
+            .build();
+        let second_order = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(engine.trader_id())
+            .instrument_id(InstrumentId::from("ETHUSDT-PERP.BINANCE"))
+            .client_order_id(ClientOrderId::from("O-SECOND-REGISTERED"))
+            .quantity(Quantity::from("1.000"))
+            .build();
+        engine
+            .kernel
+            .cache
+            .borrow_mut()
+            .add_order(
+                first_order.clone(),
+                None,
+                Some(ClientId::from("SIM")),
+                false,
+            )
+            .unwrap();
+        engine
+            .kernel
+            .cache
+            .borrow_mut()
+            .add_order(
+                second_order.clone(),
+                None,
+                Some(ClientId::from("BINANCE")),
+                false,
+            )
+            .unwrap();
+        let first_command_id = UUID4::new();
+        let second_command_id = UUID4::new();
+
+        // Submit through the second client first so aggregation order cannot be mistaken for
+        // submission chronology.
+        engine.exec_clients[1]
+            .submit_order(SubmitOrder::from_order(
+                &second_order,
+                engine.trader_id(),
+                Some(ClientId::from("BINANCE")),
+                None,
+                second_command_id,
+                UnixNanos::default(),
+            ))
+            .unwrap();
+        engine.exec_clients[0]
+            .submit_order(SubmitOrder::from_order(
+                &first_order,
+                engine.trader_id(),
+                Some(ClientId::from("SIM")),
+                None,
+                first_command_id,
+                UnixNanos::default(),
+            ))
+            .unwrap();
+
+        let records = engine.submission_records();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].instrument_id.venue, first_venue);
+        assert_eq!(records[0].command_id, first_command_id);
+        assert_eq!(records[1].instrument_id.venue, second_venue);
+        assert_eq!(records[1].command_id, second_command_id);
+    }
+
+    #[rstest]
     fn test_submission_records_survive_run_finalization(crypto_perpetual_ethusdt: CryptoPerpetual) {
         let mut engine = create_engine();
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
@@ -2961,6 +3075,7 @@ mod tests {
                 instrument_id,
                 true,
                 false,
+                Rc::new(Cell::new(0)),
             ))
             .unwrap();
         engine
@@ -2991,12 +3106,14 @@ mod tests {
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
         let instrument_id = instrument.id();
         engine.add_instrument(&instrument).unwrap();
+        let submitted_callback_count = Rc::new(Cell::new(0));
         engine
             .add_strategy(LifecycleSubmissionStrategy::new(
                 StrategyId::from("SUBMIT-ON-STOP-001"),
                 instrument_id,
                 false,
                 true,
+                Rc::clone(&submitted_callback_count),
             ))
             .unwrap();
         engine
@@ -3022,6 +3139,7 @@ mod tests {
             StrategyId::from("SUBMIT-ON-STOP-001")
         );
         assert_eq!(records[0].instrument_id, instrument_id);
+        assert_eq!(submitted_callback_count.get(), 0);
     }
 
     #[rstest]
@@ -3146,16 +3264,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        engine.exec_clients[0]
-            .submit_order(SubmitOrder::from_order(
-                &another_order,
-                engine.trader_id(),
-                Some(ClientId::from("BINANCE")),
-                None,
-                UUID4::new(),
-                UnixNanos::from(1),
-            ))
-            .unwrap();
+        execute_submission(&engine, &another_order, UUID4::new(), UnixNanos::from(1));
 
         assert_eq!(engine.submission_records().len(), 1);
         assert!(other_engine.submission_records().is_empty());
@@ -3193,10 +3302,11 @@ mod tests {
             .unwrap();
 
         engine.run(None, None, None, true).unwrap();
-        assert_eq!(engine.submission_records().len(), 1);
+        let first_chunk_records = engine.submission_records();
+        assert_eq!(first_chunk_records.len(), 1);
 
         engine.clear_data();
-        assert_eq!(engine.submission_records().len(), 1);
+        assert_eq!(engine.submission_records(), first_chunk_records);
         engine
             .add_data(
                 vec![quote_data(
@@ -3214,6 +3324,10 @@ mod tests {
 
         let records = engine.submission_records();
         assert_eq!(records.len(), 2);
+        assert_eq!(
+            &records[..first_chunk_records.len()],
+            first_chunk_records.as_slice()
+        );
         assert_eq!(client_order_ids.borrow().len(), 2);
         assert_eq!(records[0].client_order_id, client_order_ids.borrow()[0]);
         assert_eq!(records[1].client_order_id, client_order_ids.borrow()[1]);
