@@ -697,7 +697,9 @@ impl BacktestEngine {
     ///
     /// Returns an error if the backtest encounters an unrecoverable state.
     /// Callback dispatch failures abort the run and stop the trader and engines, including when
-    /// a failure is already latched before entry.
+    /// a failure is already latched before entry. Managed order book apply failures latched on
+    /// the data engine abort the run the same way, whether latched before entry or during the
+    /// run.
     pub fn run(
         &mut self,
         start: Option<UnixNanos>,
@@ -708,6 +710,12 @@ impl BacktestEngine {
         if let Some(error) = actor::callback_failure() {
             self.abort_run();
             return Err(error.into());
+        }
+
+        let first_book_apply_error = self.kernel.data_engine.borrow().first_book_apply_error();
+        if let Some(error) = first_book_apply_error {
+            self.abort_run();
+            anyhow::bail!("{error}");
         }
 
         if let Some(error) = &self.funding_error {
@@ -734,6 +742,12 @@ impl BacktestEngine {
                 }
                 _ => e,
             });
+        }
+
+        let first_book_apply_error = self.kernel.data_engine.borrow().first_book_apply_error();
+        if let Some(error) = first_book_apply_error {
+            self.abort_run();
+            anyhow::bail!("{error}");
         }
 
         // Finalize on non-streaming runs, or when a shutdown was triggered
@@ -2424,10 +2438,10 @@ mod tests {
     };
     use nautilus_execution::engine::{SnapshotAnchorer, stubs::StubExecutionClient};
     use nautilus_model::{
-        data::{Data, InstrumentStatus, QuoteTick},
+        data::{BookOrder, Data, InstrumentStatus, OrderBookDelta, OrderBookDeltas, QuoteTick},
         enums::{
-            AccountType, BookType, LiquiditySide, MarketStatus, MarketStatusAction, OmsType,
-            OrderSide, OrderStatus, OrderType, PositionSide, TriggerType,
+            AccountType, BookAction, BookType, LiquiditySide, MarketStatus, MarketStatusAction,
+            OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TriggerType,
         },
         events::{OrderEventAny, OrderSubmitted},
         identifiers::{AccountId, ActorId, ClientId, ClientOrderId, PositionId, StrategyId, Venue},
@@ -2594,6 +2608,40 @@ mod tests {
                 .set(self.submitted_callback_count.get() + 1);
         }
     });
+
+    #[derive(Debug)]
+    struct ManagedBookStrategy {
+        core: StrategyCore,
+        instrument_id: InstrumentId,
+    }
+
+    impl ManagedBookStrategy {
+        fn new(strategy_id: StrategyId, instrument_id: InstrumentId) -> Self {
+            Self {
+                core: StrategyCore::new(StrategyConfig {
+                    strategy_id: Some(strategy_id),
+                    ..Default::default()
+                }),
+                instrument_id,
+            }
+        }
+    }
+
+    impl DataActor for ManagedBookStrategy {
+        fn on_start(&mut self) -> anyhow::Result<()> {
+            self.subscribe_book_deltas(
+                self.instrument_id,
+                BookType::L3_MBO,
+                None,
+                None,
+                true, // managed
+                None,
+            );
+            Ok(())
+        }
+    }
+
+    nautilus_strategy!(ManagedBookStrategy);
 
     #[derive(Debug)]
     struct QuoteSubmissionStrategy {
@@ -2849,6 +2897,36 @@ mod tests {
         ))
     }
 
+    fn add_deltas_data(instrument_id: InstrumentId, order: BookOrder, ts: u64) -> Data {
+        let delta = OrderBookDelta::new(
+            instrument_id,
+            BookAction::Add,
+            order,
+            0,
+            1,
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        );
+        Data::BookDeltas(Box::new(OrderBookDeltas::new(instrument_id, vec![delta])))
+    }
+
+    fn create_engine_with_managed_book(
+        instrument: &CryptoPerpetual,
+        strategy_id: &str,
+    ) -> BacktestEngine {
+        let mut engine = create_engine();
+        engine
+            .add_instrument(&InstrumentAny::CryptoPerpetual(instrument.clone()))
+            .unwrap();
+        engine
+            .add_strategy(ManagedBookStrategy::new(
+                StrategyId::from(strategy_id),
+                instrument.id(),
+            ))
+            .unwrap();
+        engine
+    }
+
     fn execute_submission(
         engine: &BacktestEngine,
         order: &OrderAny,
@@ -2868,6 +2946,87 @@ mod tests {
             .exec_engine
             .borrow()
             .execute(TradingCommand::SubmitOrder(command));
+    }
+
+    #[rstest]
+    fn test_run_fails_when_managed_book_apply_fails(crypto_perpetual_ethusdt: CryptoPerpetual) {
+        let mut engine =
+            create_engine_with_managed_book(&crypto_perpetual_ethusdt, "MANAGED-BOOK-FAIL-001");
+        let instrument_id = crypto_perpetual_ethusdt.id();
+
+        // An Add with no side and an order ID unknown to the book cannot be
+        // applied and fails with `NoOrderSide`.
+        let order = BookOrder::new(None, Price::from("1000.00"), Quantity::from("1.000"), 1);
+        engine
+            .add_data(
+                vec![add_deltas_data(instrument_id, order, 1_000_000_000)],
+                None,
+                true,
+                true,
+            )
+            .unwrap();
+
+        let result = engine.run(None, None, None, false);
+
+        let latched = engine
+            .kernel
+            .data_engine
+            .borrow()
+            .first_book_apply_error()
+            .expect("failed managed book apply must latch on the data engine");
+        assert_eq!(
+            latched,
+            format!(
+                "managed book apply failed for {instrument_id} at ts_init 1000000000: \
+                 Integrity error: invalid `NoOrderSide` in book"
+            )
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            latched,
+            "run must fail with the latched managed book apply error"
+        );
+    }
+
+    #[rstest]
+    fn test_run_succeeds_when_managed_book_applies_cleanly(
+        crypto_perpetual_ethusdt: CryptoPerpetual,
+    ) {
+        let mut engine =
+            create_engine_with_managed_book(&crypto_perpetual_ethusdt, "MANAGED-BOOK-CLEAN-001");
+        let instrument_id = crypto_perpetual_ethusdt.id();
+
+        let order = BookOrder::new(
+            OrderSide::Buy,
+            Price::from("1000.00"),
+            Quantity::from("1.000"),
+            1,
+        );
+        engine
+            .add_data(
+                vec![add_deltas_data(instrument_id, order, 1_000_000_000)],
+                None,
+                true,
+                true,
+            )
+            .unwrap();
+
+        engine.run(None, None, None, false).unwrap();
+
+        assert_eq!(
+            engine.kernel.data_engine.borrow().first_book_apply_error(),
+            None,
+            "a clean managed book apply must not latch an error"
+        );
+        let cache = engine.kernel.cache.borrow();
+        let book = cache
+            .order_book(&instrument_id)
+            .expect("managed subscription must seed a cache book");
+        assert_eq!(
+            book.best_bid_price(),
+            Some(Price::from("1000.00")),
+            "the delivered delta must have been applied to the managed book"
+        );
     }
 
     #[rstest]

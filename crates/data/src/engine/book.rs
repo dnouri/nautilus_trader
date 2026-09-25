@@ -74,6 +74,12 @@ pub(crate) enum BookDeltasUnsubscribeResult {
     Removed,
 }
 
+/// Shared latch holding the first managed order book apply failure, if any.
+///
+/// Written by [`BookUpdater`] when applying a deltas batch fails; owned by the
+/// [`DataEngine`](crate::engine::DataEngine) so runners can surface the failure.
+pub(crate) type FirstBookApplyError = Rc<RefCell<Option<String>>>;
+
 /// Handles order book updates and delta processing for a specific instrument.
 ///
 /// The `BookUpdater` processes incoming order book deltas and maintains
@@ -85,6 +91,7 @@ pub struct BookUpdater {
     pub instrument_id: InstrumentId,
     pub cache: Rc<RefCell<Cache>>,
     pub emit_quotes_from_book: bool,
+    pub first_book_apply_error: FirstBookApplyError,
 }
 
 impl BookUpdater {
@@ -93,12 +100,14 @@ impl BookUpdater {
         instrument_id: &InstrumentId,
         cache: Rc<RefCell<Cache>>,
         emit_quotes_from_book: bool,
+        first_book_apply_error: FirstBookApplyError,
     ) -> Self {
         Self {
             id: Ustr::from(&format!("{}-{}", stringify!(BookUpdater), instrument_id)),
             instrument_id: *instrument_id,
             cache,
             emit_quotes_from_book,
+            first_book_apply_error,
         }
     }
 }
@@ -115,6 +124,13 @@ impl Handler<OrderBookDeltas> for BookUpdater {
             if let Some(book) = cache.order_book_mut(&deltas.instrument_id) {
                 if let Err(e) = book.apply_deltas(deltas) {
                     log::error!("Failed to apply deltas: {e}");
+                    latch_first_error(
+                        &self.first_book_apply_error,
+                        &format!(
+                            "managed book apply failed for {} at ts_init {}: {e}",
+                            deltas.instrument_id, deltas.ts_init
+                        ),
+                    );
                     return;
                 }
 
@@ -154,6 +170,14 @@ impl Handler<OrderBookDepth> for BookUpdater {
         if let Some(quote) = emit {
             publish_quote_if_changed(&self.cache, quote);
         }
+    }
+}
+
+/// Latches `message` as the first apply failure, keeping any earlier message.
+fn latch_first_error(latch: &FirstBookApplyError, message: &str) {
+    let mut first_error = latch.borrow_mut();
+    if first_error.is_none() {
+        *first_error = Some(message.to_string());
     }
 }
 

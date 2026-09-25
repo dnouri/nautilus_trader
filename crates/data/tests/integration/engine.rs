@@ -81,7 +81,7 @@ use nautilus_model::defi::{
 #[cfg(feature = "defi")]
 use nautilus_model::enums::CurrencyType;
 #[cfg(feature = "streaming")]
-use nautilus_model::enums::{BookAction, OrderSide};
+use nautilus_model::enums::OrderSide;
 use nautilus_model::{
     data::{
         Bar, BarType, BookOrder, CustomData, DEPTH10_LEN, Data, DataRef, DataType,
@@ -94,7 +94,7 @@ use nautilus_model::{
         },
     },
     enums::{
-        AggressorSide, AssetClass, BookType, GreeksConvention, InstrumentClass,
+        AggressorSide, AssetClass, BookAction, BookType, GreeksConvention, InstrumentClass,
         InstrumentCloseType, MarketStatusAction, OptionKind, PriceType, RecordFlag,
     },
     identifiers::{ClientId, InstrumentId, OptionSeriesId, Symbol, TradeId, TraderId, Venue},
@@ -5689,6 +5689,83 @@ fn test_emit_quotes_from_book_publishes_on_delta_apply(
     // Same deltas, same top-of-book: idempotent
     data_engine.process_data(Data::BookDeltas(deltas));
     assert_eq!(saver.get_messages().len(), 1);
+}
+
+#[rstest]
+fn test_managed_book_apply_failure_latches_first_error(
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+) {
+    let _ = stub_msgbus;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    let mut data_engine = DataEngine::new(clock, cache.clone(), None);
+
+    let instrument_id = InstrumentId::from("AAPL.XNAS");
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        test_clock,
+        cache,
+        client_id,
+        instrument_id.venue,
+        None,
+        &recorder,
+        &mut data_engine,
+    );
+
+    data_engine.execute(DataCommand::Subscribe(SubscribeCommand::BookDeltas(
+        SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L3_MBO,
+            Some(client_id),
+            Some(instrument_id.venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            true, // managed
+            None,
+            None,
+        ),
+    )));
+
+    assert_eq!(
+        data_engine.first_book_apply_error(),
+        None,
+        "no failure is latched before any data arrives"
+    );
+
+    // An Add with no side and an order ID unknown to the book cannot be
+    // applied and fails with `NoOrderSide`.
+    let no_side_add_deltas = |ts: u64| {
+        let delta = OrderBookDelta::new(
+            instrument_id,
+            BookAction::Add,
+            BookOrder::new(None, Price::from("101.00"), Quantity::from("100"), 1),
+            0,
+            1,
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        );
+        OrderBookDeltas::new(instrument_id, vec![delta])
+    };
+
+    data_engine.process_data(Data::BookDeltas(Box::new(no_side_add_deltas(1))));
+
+    let latched = data_engine
+        .first_book_apply_error()
+        .expect("failed managed book apply must latch on the data engine");
+    assert_eq!(
+        latched,
+        format!(
+            "managed book apply failed for {instrument_id} at ts_init 1: \
+             Integrity error: invalid `NoOrderSide` in book"
+        )
+    );
+
+    // Only the first failure is latched; later failures do not replace it.
+    data_engine.process_data(Data::BookDeltas(Box::new(no_side_add_deltas(2))));
+    assert_eq!(data_engine.first_book_apply_error(), Some(latched));
 }
 
 #[rstest]

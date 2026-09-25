@@ -61,6 +61,7 @@ use bar::{BarAggregatorKey, bar_aggregator_key};
 use book::{
     BookDeltasKey, BookDeltasUnsubscribeResult, BookSnapshotInfo, BookSnapshotInfos,
     BookSnapshotKey, BookSnapshotUnsubscribeResult, BookSnapshotter, BookUpdater,
+    FirstBookApplyError,
 };
 pub(crate) use commands::{DeferredCommand, DeferredCommandQueue};
 use config::DataEngineConfig;
@@ -166,6 +167,7 @@ pub struct DataEngine {
     book_deltas_counts: IndexMap<BookDeltasKey, usize>,
     book_depth_counts: IndexMap<BookDeltasKey, usize>,
     book_updaters: AHashMap<InstrumentId, Rc<BookUpdater>>,
+    first_book_apply_error: FirstBookApplyError,
     book_deltas_parent_expansions: AHashMap<InstrumentId, Vec<InstrumentId>>,
     book_depth_parent_expansions: AHashMap<InstrumentId, Vec<InstrumentId>>,
     book_snapshotters: AHashMap<NonZeroUsize, Rc<BookSnapshotter>>,
@@ -246,6 +248,7 @@ impl DataEngine {
             book_deltas_counts: IndexMap::new(),
             book_depth_counts: IndexMap::new(),
             book_updaters: AHashMap::new(),
+            first_book_apply_error: Rc::new(RefCell::new(None)),
             book_deltas_parent_expansions: AHashMap::new(),
             book_depth_parent_expansions: AHashMap::new(),
             book_snapshotters: AHashMap::new(),
@@ -812,6 +815,16 @@ impl DataEngine {
             .into_iter()
             .map(|client| client.client_id())
             .collect()
+    }
+
+    /// Returns the first managed order book apply failure latched by a
+    /// [`BookUpdater`], if any.
+    ///
+    /// Only the first failure is retained; later failures are logged but do not
+    /// replace the latched message.
+    #[must_use]
+    pub fn first_book_apply_error(&self) -> Option<String> {
+        self.first_book_apply_error.borrow().clone()
     }
 
     pub(crate) fn collect_subscriptions<F, T>(&self, get_subs: F) -> Vec<T>
@@ -4657,6 +4670,7 @@ impl DataEngine {
                         target_id,
                         self.cache.clone(),
                         self.config.emit_quotes_from_book,
+                        self.first_book_apply_error.clone(),
                     ))
                 })
                 .clone();
